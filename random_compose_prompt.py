@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
+
 import argparse
 import json
 import random
 import re
 import sys
 from pathlib import Path
+
+VERSION = "2.0-fixed"
 
 CATEGORY_MAP = {
     1: "distance",
@@ -17,164 +20,192 @@ CATEGORY_MAP = {
     8: "head_pose",
 }
 
+DEFAULT_FRAGMENTS = "1,2,3,4,5,6,7,8"
+DEFAULT_JSON = Path(__file__).with_name("camera_pose_categories_v2.json")
+
 
 def parse_fragments(value: str):
-    """Parse -fragments like: 1,3,5"""
-    if not value:
-        raise ValueError("-fragments cannot be empty")
-
     result = []
     seen = set()
-    for chunk in value.split(','):
+
+    for chunk in value.split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
+
         try:
-            n = int(chunk)
+            number = int(chunk)
         except ValueError:
             raise ValueError(f"Invalid fragment number: {chunk}")
-        if n not in CATEGORY_MAP:
-            raise ValueError(f"Fragment number out of range: {n} (must be 1-8)")
-        if n not in seen:
-            result.append(n)
-            seen.add(n)
+
+        if number not in CATEGORY_MAP:
+            raise ValueError(f"Fragment number must be 1-8: {number}")
+
+        if number not in seen:
+            result.append(number)
+            seen.add(number)
 
     if not result:
-        raise ValueError("No valid fragment numbers found in -fragments")
+        raise ValueError("No valid fragment categories were selected")
+
     return result
 
 
 def parse_range_spec(value: str):
-    """
-    Parse -range like: 1:[3-6],3:[3-4]
-    Meaning:
-      category 1 => only choose from entries 3..6 (1-based, inclusive)
-      category 3 => only choose from entries 3..4 (1-based, inclusive)
-    """
     if not value:
         return {}
 
-    specs = {}
-    matches = re.findall(r'(\d+)\s*:\s*\[(\d+)\s*-\s*(\d+)\]', value)
+    compact = re.sub(r"\s+", "", value)
+    pattern = re.compile(r"(\d+):\[(\d+)-(\d+)\]")
+    matches = pattern.findall(compact)
+
     if not matches:
-        raise ValueError(
-            "Invalid -range format. Example: 1:[3-6],3:[3-4]"
-        )
+        raise ValueError("Invalid -range syntax. Example: 1:[3-6],3:[3-4]")
 
-    # Validate that the whole string is composed only of valid specs joined by commas.
-    cleaned = re.sub(r'\s+', '', value)
-    rebuilt = ','.join(f'{a}:[{b}-{c}]' for a, b, c in matches)
-    if cleaned != rebuilt:
-        raise ValueError(
-            "Invalid -range format. Example: 1:[3-6],3:[3-4]"
-        )
+    reconstructed = ",".join(
+        f"{category}:[{start}-{end}]"
+        for category, start, end in matches
+    )
 
-    for cat_s, start_s, end_s in matches:
-        cat = int(cat_s)
-        start = int(start_s)
-        end = int(end_s)
+    if reconstructed != compact:
+        raise ValueError("Invalid -range syntax. Example: 1:[3-6],3:[3-4]")
 
-        if cat not in CATEGORY_MAP:
-            raise ValueError(f"Range category out of range: {cat} (must be 1-8)")
+    ranges = {}
+
+    for category_text, start_text, end_text in matches:
+        category = int(category_text)
+        start = int(start_text)
+        end = int(end_text)
+
+        if category not in CATEGORY_MAP:
+            raise ValueError(f"Range category must be 1-8: {category}")
         if start < 1 or end < 1:
-            raise ValueError(f"Range indices must be >= 1: {cat}:[{start}-{end}]")
+            raise ValueError("Range indices are 1-based and must be >= 1")
         if start > end:
-            raise ValueError(f"Range start > end: {cat}:[{start}-{end}]")
+            raise ValueError(
+                f"Range start cannot exceed end: {category}:[{start}-{end}]"
+            )
 
-        specs[cat] = (start, end)
+        ranges[category] = (start, end)
 
-    return specs
-
-
-def load_categories(json_path: Path):
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    return data
+    return ranges
 
 
-def pick_from_category(data, cat_num, range_specs):
-    cat_name = CATEGORY_MAP[cat_num]
-    entries = data[cat_name]
+def load_data(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"JSON file not found: {path}\n"
+            "Put camera_pose_categories_v2.json in the same directory as this script, "
+            "or specify another file with -json PATH."
+        )
 
-    if cat_num in range_specs:
-        start, end = range_specs[cat_num]
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def choose_entry(data, category_number, ranges):
+    category_name = CATEGORY_MAP[category_number]
+
+    if category_name not in data:
+        raise KeyError(f"Missing category in JSON: {category_name}")
+
+    entries = data[category_name]
+
+    if category_number in ranges:
+        start, end = ranges[category_number]
+
         if end > len(entries):
             raise ValueError(
-                f"Range {cat_num}:[{start}-{end}] exceeds category '{cat_name}' size ({len(entries)})"
+                f"{category_number}:[{start}-{end}] exceeds "
+                f"'{category_name}' size ({len(entries)})"
             )
-        # Convert 1-based inclusive to Python slice.
-        pool = entries[start - 1:end]
-    else:
-        pool = entries
 
-    if not pool:
-        raise ValueError(f"No entries available for category {cat_num} ({cat_name})")
+        # User-facing ranges are 1-based and inclusive.
+        entries = entries[start - 1:end]
 
-    return random.choice(pool)
+    return random.choice(entries)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compose a random prompt from selected fragment categories."
+        description="Randomly combine camera/pose prompt fragments."
     )
+
     parser.add_argument(
-        '-fragments',
-        required=True,
-        help='Comma-separated category numbers, e.g. 1,3,5'
+        "-fragments",
+        default=DEFAULT_FRAGMENTS,
+        help=(
+            "Comma-separated category numbers. "
+            "Default: 1,2,3,4,5,6,7,8 (all categories). "
+            "Example: -fragments 1,3,5"
+        ),
     )
+
     parser.add_argument(
-        '-range',
-        dest='range_spec',
-        default='',
-        help='Optional range restriction, e.g. 1:[3-6],3:[3-4]'
+        "-range",
+        dest="range_spec",
+        default="",
+        help=(
+            "Restrict one or more categories to 1-based inclusive ranges. "
+            "Example: -range '1:[3-6],3:[3-4]'"
+        ),
     )
+
     parser.add_argument(
-        '-json',
-        default='/mnt/data/camera_pose_categories_v2.json',
-        help='Path to the category JSON file'
+        "-json",
+        type=Path,
+        default=DEFAULT_JSON,
+        help="Path to JSON fragment database. Default: camera_pose_categories_v2.json beside this script.",
     )
+
     parser.add_argument(
-        '-seed',
+        "-seed",
         type=int,
         default=None,
-        help='Optional random seed'
+        help="Optional random seed for reproducible output.",
     )
+
     parser.add_argument(
-        '--show-indices',
-        action='store_true',
-        help='Show selected category numbers and names before the final prompt'
+        "--show-indices",
+        action="store_true",
+        help="Print each selected category and value before the final prompt.",
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
     )
 
     args = parser.parse_args()
 
     try:
-        fragment_nums = parse_fragments(args.fragments)
-        range_specs = parse_range_spec(args.range_spec)
-        data = load_categories(Path(args.json))
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        fragment_numbers = parse_fragments(args.fragments)
+        ranges = parse_range_spec(args.range_spec)
+        data = load_data(args.json)
 
-    if args.seed is not None:
-        random.seed(args.seed)
+        if args.seed is not None:
+            random.seed(args.seed)
 
-    chosen = []
-    try:
-        for cat_num in fragment_nums:
-            value = pick_from_category(data, cat_num, range_specs)
-            chosen.append((cat_num, CATEGORY_MAP[cat_num], value))
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        selected = []
+        for category_number in fragment_numbers:
+            value = choose_entry(data, category_number, ranges)
+            selected.append(
+                (category_number, CATEGORY_MAP[category_number], value)
+            )
+
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     if args.show_indices:
-        for cat_num, cat_name, value in chosen:
-            print(f"[{cat_num}] {cat_name}: {value}")
+        for number, name, value in selected:
+            print(f"[{number}] {name}: {value}")
         print()
 
-    prompt = ', '.join(value for _, _, value in chosen)
-    print(prompt)
+    print(", ".join(value for _, _, value in selected))
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())
